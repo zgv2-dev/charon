@@ -1,0 +1,16 @@
+name: test
+
+# Every push runs the tests on Windows, where the apps run: it also exercises the WSAECONNRESET and exclusive-bind
+# paths. Apps depend on a commit (`rev`), so there are no releases.
+on:
+  push:
+    branches: ['**']
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
