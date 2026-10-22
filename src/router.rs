@@ -69,6 +69,8 @@ struct Shared {
     inbound: Mutex<Option<Arc<UdpSocket>>>,
     listen: Mutex<SocketAddr>,
     outputs: Mutex<Vec<Arc<Output>>>,
+    /// Targets whose datagrams are dropped.
+    read_only: Mutex<Vec<SocketAddr>>,
     /// One vehicle at a time: the latest source seen on the listen port.
     vehicle: Mutex<Option<(SocketAddr, Instant)>>,
     stats: Mutex<Stats>,
@@ -88,6 +90,7 @@ impl Router {
             inbound: Mutex::default(),
             listen: Mutex::new(listen),
             outputs: Mutex::default(),
+            read_only: Mutex::default(),
             vehicle: Mutex::default(),
             stats: Mutex::default(),
             tlog: Mutex::default(),
@@ -169,6 +172,11 @@ impl Router {
             tracing::info!("output removed: {}", o.target);
         }
         Ok(())
+    }
+
+    /// Whatever these outputs send from now on is counted and dropped: not routed, recorded or shown to plugins.
+    pub fn set_read_only(&self, targets: &[SocketAddr]) {
+        *self.shared.read_only.lock().unwrap() = targets.to_vec();
     }
 
     /// `Some(dir)` starts a new log file there; `None` stops recording.
@@ -312,6 +320,9 @@ async fn output_loop(shared: Arc<Shared>, out: Arc<Output>) {
             c.packets_in += 1;
             c.bytes_in += n as u64;
             c.last_rx = Some(Instant::now());
+        }
+        if shared.read_only.lock().unwrap().contains(&out.target) {
+            continue;
         }
         shared.stats.lock().unwrap().ingest(data, Instant::now());
         shared.record(data);

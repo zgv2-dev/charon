@@ -91,6 +91,8 @@ async fn run(
                 format!("{o} can't be an output: it targets the listen port and would loop")
             }),
         );
+        // before the outputs, so a new read-only output never routes a datagram
+        router.set_read_only(&cfg.read_only);
         if let Err(e) = router.set_outputs(&outputs).await {
             warns.push(format!("Output setup failed: {e}"));
         }

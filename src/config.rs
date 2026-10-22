@@ -13,6 +13,8 @@ pub struct Config {
     /// Where the vehicle sends.
     pub listen: SocketAddr,
     pub outputs: Vec<SocketAddr>,
+    /// Outputs that only listen: whatever they send is counted and dropped, so it never reaches the vehicle.
+    pub read_only: Vec<SocketAddr>,
     pub autostart: bool,
     pub record_tlog: bool,
     /// Link transition sounds; toggled from the window or the extension popup.
@@ -26,6 +28,7 @@ impl Default for Config {
             listen: crate::router::LISTEN,
             // The GCS on this machine. An app with more local listeners passes its own defaults to `load_or`.
             outputs: vec!["127.0.0.1:14550".parse().unwrap()],
+            read_only: Vec::new(),
             autostart: true,
             record_tlog: false,
             sound: true,

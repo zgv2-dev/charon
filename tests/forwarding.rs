@@ -65,6 +65,33 @@ async fn gcs_reply_goes_to_vehicle_and_other_outputs_not_back() {
 }
 
 #[tokio::test]
+async fn a_read_only_output_reaches_neither_the_vehicle_nor_other_outputs() {
+    let (gcs, tel, vehicle) = (sock().await, sock().await, sock().await);
+    let r = router(&[&gcs, &tel]).await;
+    r.set_read_only(&[tel.local_addr().unwrap()]);
+    vehicle
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .await
+        .unwrap();
+    recv(&gcs).await;
+    let (hb, tel_port) = recv(&tel).await;
+    assert_eq!(hb, heartbeat(0, 1, 1, 2, 3), "it still hears the vehicle");
+
+    tel.send_to(&heartbeat(0, 255, 190, 6, 8), tel_port)
+        .await
+        .unwrap();
+    nothing(&vehicle).await;
+    nothing(&gcs).await;
+    let snap = r.snapshot();
+    let out = snap
+        .outputs
+        .iter()
+        .find(|o| o.target == tel.local_addr().unwrap())
+        .unwrap();
+    assert_eq!(out.counters.packets_in, 1, "counted");
+}
+
+#[tokio::test]
 async fn unknown_and_garbage_bytes_forwarded_untouched() {
     let (gcs, vehicle) = (sock().await, sock().await);
     let r = router(&[&gcs]).await;
