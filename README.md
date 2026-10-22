@@ -41,10 +41,14 @@ async fn main() -> std::io::Result<()> {
 | --- | --- |
 | `router` | The UDP fan-out. The listen address can move while running; outputs keep their sockets. |
 | `supervisor` | Owns the router and applies config changes in order, with warnings for ones that can't apply. |
-| `config` | Listen address, outputs, autostart, tlog recording. `load_or` takes the app's defaults. |
+| `config` | Listen address, outputs (any of them read-only), tlog recording, and autostart with the feature. `load_or` takes the app's defaults. |
 | `stats` | Heartbeat age, loss and health of the one vehicle. |
 | `frame` | MAVLink v1/v2 frame boundaries, headers and CRC. Payloads aren't decoded. |
 | `plugin` | The `Plugin` trait. |
 | `tlog` | Records and reads Mission Planner tlogs. |
-| `platform` | Single instance, window focus, exclusive UDP bind, data folders, autostart and toasts. Windows-only calls have stubs elsewhere. |
+| `platform` | Single instance, window focus, exclusive UDP bind, data folders, toasts, and `set_autostart` with the feature. Windows-only calls have stubs elsewhere. |
 | `logging` | Daily log files in the app's data folder. |
+
+Starting at login is opt-in: an app that wants it turns on the `autostart` feature
+(`charon = { ..., features = ["autostart"] }`), which adds `Config::autostart` and `platform::set_autostart`. Without
+it, none of that code is built.

@@ -6,7 +6,7 @@ description = "Ferries a vehicle's MAVLink stream to the GCS and whatever else l
 repository = "https://github.com/zgv2-dev/charon"
 
 [dependencies]
-auto-launch = "0.6.0"
+auto-launch = { version = "0.6.0", optional = true }
 directories = "6.0.0"
 mavlink = { version = "0.19.1", default-features = false, features = ["std", "dialect-ardupilotmega"] }
 notify-rust = "4.18.2"
@@ -17,6 +17,10 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3.23"
+
+[features]
+# Starting at login is the app's choice: this adds Config::autostart and platform::set_autostart.
+autostart = ["dep:auto-launch"]
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

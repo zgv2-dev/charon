@@ -133,7 +133,8 @@ pub fn tlog_dir() -> std::path::PathBuf {
     dirs().data_dir().join("tlogs")
 }
 
-/// HKCU Run key on Windows. Login launches pass `--hidden`.
+/// HKCU Run key on Windows. Login launches pass `--hidden`. Only with the `autostart` feature.
+#[cfg(feature = "autostart")]
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let launcher = auto_launch::AutoLaunchBuilder::new()

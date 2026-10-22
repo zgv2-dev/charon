@@ -15,6 +15,8 @@ pub struct Config {
     pub outputs: Vec<SocketAddr>,
     /// Outputs that only listen: whatever they send is counted and dropped, so it never reaches the vehicle.
     pub read_only: Vec<SocketAddr>,
+    /// Start at login. Only with the `autostart` feature, which an app turns on for itself.
+    #[cfg(feature = "autostart")]
     pub autostart: bool,
     pub record_tlog: bool,
     /// Link transition sounds; toggled from the window or the extension popup.
@@ -29,7 +31,8 @@ impl Default for Config {
             // The GCS on this machine. An app with more local listeners passes its own defaults to `load_or`.
             outputs: vec!["127.0.0.1:14550".parse().unwrap()],
             read_only: Vec::new(),
-            autostart: true,
+            #[cfg(feature = "autostart")]
+            autostart: false,
             record_tlog: false,
             sound: true,
         }
@@ -123,9 +126,9 @@ mod tests {
     fn partial_file_fills_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "autostart = false\n").unwrap();
+        std::fs::write(&path, "record_tlog = true\n").unwrap();
         let c = Config::load(&path).unwrap();
-        assert!(!c.autostart);
+        assert!(c.record_tlog);
         assert_eq!(c.outputs, Config::default().outputs);
         assert_eq!(c.version, CONFIG_VERSION);
     }
@@ -142,9 +145,9 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(Config::load_or(&path, fallback.clone()).unwrap(), fallback);
-        std::fs::write(&path, "autostart = false\n").unwrap();
+        std::fs::write(&path, "record_tlog = true\n").unwrap();
         let c = Config::load_or(&path, fallback.clone()).unwrap();
-        assert!(!c.autostart);
+        assert!(c.record_tlog);
         assert_eq!(c.outputs, fallback.outputs);
     }
 
