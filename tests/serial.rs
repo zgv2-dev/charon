@@ -1,5 +1,9 @@
 //! A serial source, over a pseudo-terminal: what a USB telemetry radio looks like to the router.
-#![cfg(unix)]
+//!
+//! Linux only. On macOS the serialport crate always sets the baud rate with the IOSSIOSPEED ioctl, which a
+//! pseudo-terminal refuses (ENOTTY), so no pty can stand in for a radio there; real USB serial ports take it. Windows
+//! has no ptys.
+#![cfg(target_os = "linux")]
 
 use std::{
     ffi::CStr,

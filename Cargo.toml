@@ -36,5 +36,5 @@ tracing-subscriber = "0.3.23"
 [[example]]
 name = "run"
 
-[target."cfg(unix)".dev-dependencies]
+[target."cfg(target_os = \"linux\")".dev-dependencies]
 libc = "0.2"
