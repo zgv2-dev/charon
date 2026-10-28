@@ -2,9 +2,9 @@ name: test
 
 # Every push runs the tests on all three desktops. Windows is where the apps mostly run: it also exercises the
 # WSAECONNRESET and exclusive-bind paths. Apps depend on a commit (`rev`), so there are no releases.
+# Off for now (out of Actions minutes): run it by hand from the Actions tab.
 on:
-  push:
-    branches: ['**']
+  workflow_dispatch:
 
 jobs:
   test:
