@@ -21,8 +21,9 @@ fn pty() -> (File, String) {
             &mut master,
             &mut slave,
             name.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
+            // *mut on macOS, *const on Linux: a null *mut passes as either
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(r, 0, "openpty");
