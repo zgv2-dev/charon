@@ -51,12 +51,15 @@ async fn a_serial_vehicle_reaches_the_gcs_and_hears_it() {
     let (r, _) = Router::start(source, &[Output::new("GCS", Endpoint::UdpOut(to))])
         .await
         .unwrap();
+    let mut state = r.snapshot().source.unwrap().state;
     for _ in 0..100 {
-        if r.snapshot().source.unwrap().state == charon::link::State::Connected {
+        if state == charon::link::State::Connected {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+        state = r.snapshot().source.unwrap().state;
     }
+    assert_eq!(state, charon::link::State::Connected, "the port opens");
 
     let hb = heartbeat(0, 1, 1, 2, 3);
     radio.write_all(&hb).unwrap();
