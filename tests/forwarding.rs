@@ -1,6 +1,8 @@
 use std::{net::SocketAddr, time::Duration};
 
 use charon::{
+    config::Output,
+    endpoint::Endpoint,
     frame::testutil::heartbeat,
     router::{Router, port_taken},
 };
@@ -29,11 +31,23 @@ async fn nothing(s: &UdpSocket) {
     );
 }
 
+fn out(s: &UdpSocket) -> Output {
+    out_to(s.local_addr().unwrap())
+}
+
+fn out_to(addr: SocketAddr) -> Output {
+    Output::new(addr.to_string(), Endpoint::UdpOut(addr))
+}
+
+fn any_port() -> Endpoint {
+    Endpoint::UdpIn("127.0.0.1:0".parse().unwrap())
+}
+
 async fn router(outputs: &[&UdpSocket]) -> Router {
-    let targets: Vec<SocketAddr> = outputs.iter().map(|s| s.local_addr().unwrap()).collect();
-    Router::start("127.0.0.1:0".parse().unwrap(), &targets)
-        .await
-        .unwrap()
+    let outputs: Vec<Output> = outputs.iter().map(|s| out(s)).collect();
+    let (r, failed) = Router::start(any_port(), &outputs).await.unwrap();
+    assert!(failed.is_empty());
+    r
 }
 
 #[tokio::test]
@@ -41,7 +55,7 @@ async fn vehicle_frames_reach_every_output() {
     let (gcs, tel, vehicle) = (sock().await, sock().await, sock().await);
     let r = router(&[&gcs, &tel]).await;
     let hb = heartbeat(0, 1, 1, 2, 3);
-    vehicle.send_to(&hb, r.local_addr()).await.unwrap();
+    vehicle.send_to(&hb, r.local_addr().unwrap()).await.unwrap();
     assert_eq!(recv(&gcs).await.0, hb);
     assert_eq!(recv(&tel).await.0, hb);
 }
@@ -51,7 +65,7 @@ async fn gcs_reply_goes_to_vehicle_and_other_outputs_not_back() {
     let (gcs, tel, vehicle) = (sock().await, sock().await, sock().await);
     let r = router(&[&gcs, &tel]).await;
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, gcs_port) = recv(&gcs).await;
@@ -67,10 +81,11 @@ async fn gcs_reply_goes_to_vehicle_and_other_outputs_not_back() {
 #[tokio::test]
 async fn a_read_only_output_reaches_neither_the_vehicle_nor_other_outputs() {
     let (gcs, tel, vehicle) = (sock().await, sock().await, sock().await);
-    let r = router(&[&gcs, &tel]).await;
-    r.set_read_only(&[tel.local_addr().unwrap()]);
+    let (r, _) = Router::start(any_port(), &[out(&gcs), out(&tel).read_only()])
+        .await
+        .unwrap();
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     recv(&gcs).await;
@@ -86,9 +101,9 @@ async fn a_read_only_output_reaches_neither_the_vehicle_nor_other_outputs() {
     let out = snap
         .outputs
         .iter()
-        .find(|o| o.target == tel.local_addr().unwrap())
+        .find(|o| o.link.endpoint == Endpoint::UdpOut(tel.local_addr().unwrap()))
         .unwrap();
-    assert_eq!(out.counters.packets_in, 1, "counted");
+    assert_eq!(out.link.counters.packets_in, 1, "counted");
 }
 
 #[tokio::test]
@@ -96,7 +111,10 @@ async fn unknown_and_garbage_bytes_forwarded_untouched() {
     let (gcs, vehicle) = (sock().await, sock().await);
     let r = router(&[&gcs]).await;
     let junk = [0x00, 0xFD, 0x01, 0x02, 0x03];
-    vehicle.send_to(&junk, r.local_addr()).await.unwrap();
+    vehicle
+        .send_to(&junk, r.local_addr().unwrap())
+        .await
+        .unwrap();
     assert_eq!(recv(&gcs).await.0, junk);
 }
 
@@ -105,16 +123,13 @@ async fn forwarding_survives_a_vanished_peer() {
     // Windows reports ICMP port-unreachable as WSAECONNRESET on the next recv; loops must keep going.
     let dead = sock().await.local_addr().unwrap(); // socket dropped: port closed
     let gcs = sock().await;
-    let r = Router::start(
-        "127.0.0.1:0".parse().unwrap(),
-        &[dead, gcs.local_addr().unwrap()],
-    )
-    .await
-    .unwrap();
+    let (r, _) = Router::start(any_port(), &[out_to(dead), out(&gcs)])
+        .await
+        .unwrap();
 
     let old_vehicle = sock().await;
     old_vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, gcs_port) = recv(&gcs).await;
@@ -127,7 +142,7 @@ async fn forwarding_survives_a_vanished_peer() {
     let vehicle = sock().await;
     for seq in 1..5 {
         let hb = heartbeat(seq, 1, 1, 2, 3);
-        vehicle.send_to(&hb, r.local_addr()).await.unwrap();
+        vehicle.send_to(&hb, r.local_addr().unwrap()).await.unwrap();
         assert_eq!(recv(&gcs).await.0, hb);
     }
 }
@@ -138,12 +153,12 @@ async fn replies_reach_a_vehicle_that_changed_port() {
     let r = router(&[&gcs]).await;
     let (first, second) = (sock().await, sock().await);
     first
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, gcs_port) = recv(&gcs).await;
     second
-        .send_to(&heartbeat(1, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(1, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     recv(&gcs).await;
@@ -158,16 +173,14 @@ async fn set_outputs_keeps_unchanged_output_socket() {
     let (gcs, tel, vehicle) = (sock().await, sock().await, sock().await);
     let r = router(&[&gcs]).await;
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, before) = recv(&gcs).await;
 
-    r.set_outputs(&[gcs.local_addr().unwrap(), tel.local_addr().unwrap()])
-        .await
-        .unwrap();
+    assert!(r.set_outputs(&[out(&gcs), out(&tel)]).await.is_empty());
     vehicle
-        .send_to(&heartbeat(1, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(1, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, after) = recv(&gcs).await;
@@ -180,14 +193,14 @@ async fn listen_port_cannot_be_shared() {
     let r = router(&[]).await;
     let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
     s.set_reuse_address(true).unwrap(); // what a GCS might do; SO_EXCLUSIVEADDRUSE must still win on Windows
-    let err = s.bind(&r.local_addr().into()).unwrap_err();
+    let err = s.bind(&r.local_addr().unwrap().into()).unwrap_err();
     assert!(port_taken(&err), "{err}");
 }
 
 #[tokio::test]
 async fn start_reports_taken_port() {
     let gcs = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let err = Router::start(gcs.local_addr().unwrap(), &[])
+    let err = Router::start(Endpoint::UdpIn(gcs.local_addr().unwrap()), &[])
         .await
         .err()
         .expect("bind must fail");
@@ -199,7 +212,7 @@ async fn snapshot_reports_vehicle_and_gcs() {
     let (gcs, vehicle) = (sock().await, sock().await);
     let r = router(&[&gcs]).await;
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, gcs_port) = recv(&gcs).await;
@@ -209,12 +222,14 @@ async fn snapshot_reports_vehicle_and_gcs() {
     recv(&vehicle).await;
 
     let snap = r.snapshot();
-    assert_eq!(snap.listen, r.local_addr());
+    assert_eq!(snap.source.unwrap().local_addr, r.local_addr());
     assert_eq!(snap.vehicle.unwrap().sysid, 1);
     assert_eq!(snap.health, charon::stats::Health::Ok);
     let out = &snap.outputs[0];
     assert!(out.gcs_connected);
-    assert_eq!((out.counters.packets_out, out.counters.packets_in), (1, 1));
+    let c = &out.link.counters;
+    assert_eq!((c.packets_out, c.packets_in), (1, 1));
+    assert_eq!(snap.vehicles.len(), 1);
 }
 
 #[tokio::test]
@@ -224,7 +239,7 @@ async fn records_both_directions_to_tlog() {
     let r = router(&[&gcs]).await;
     r.set_tlog(Some(dir.path())).unwrap();
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     let (_, gcs_port) = recv(&gcs).await;
@@ -256,7 +271,7 @@ async fn cut_closes_the_tlog_and_records_on_in_a_new_one() {
     assert!(r.cut_tlog().unwrap().is_none());
     r.set_tlog(Some(dir.path())).unwrap();
     vehicle
-        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr())
+        .send_to(&heartbeat(0, 1, 1, 2, 3), r.local_addr().unwrap())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await; // file names are per second
@@ -284,19 +299,17 @@ async fn plugins_see_both_directions() {
     let seen = std::sync::Arc::new(Seen::default());
     r.add_plugin(seen.clone());
     let hb = heartbeat(0, 1, 1, 2, 3);
-    vehicle.send_to(&hb, r.local_addr()).await.unwrap();
+    vehicle.send_to(&hb, r.local_addr().unwrap()).await.unwrap();
     let (_, router_port) = recv(&gcs).await;
     let reply = heartbeat(0, 255, 190, 6, 8);
     gcs.send_to(&reply, router_port).await.unwrap();
     recv(&vehicle).await;
+    let id = r.snapshot().outputs[0].id;
     assert_eq!(
         *seen.0.lock().unwrap(),
         [
             (hb, charon::plugin::Side::Vehicle),
-            (
-                reply,
-                charon::plugin::Side::Output(gcs.local_addr().unwrap())
-            ),
+            (reply, charon::plugin::Side::Output(id)),
         ]
     );
 }

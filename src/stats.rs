@@ -1,4 +1,5 @@
-//! Heartbeat and loss tracking for the one vehicle. Fed every datagram the router sees.
+//! Heartbeat and loss tracking for every vehicle heard, and the health of the one followed. Fed every datagram the
+//! router sees.
 
 use std::{
     collections::HashMap,
@@ -29,6 +30,8 @@ pub struct VehicleStatus {
     pub heartbeat_age: Duration,
     pub received: u64,
     pub lost: u64,
+    /// Every component heard on this sysid: the autopilot, a camera, a companion computer.
+    pub components: Vec<u8>,
 }
 
 /// One (sysid, compid) pair: MAVLink sequence numbers count per component.
@@ -40,11 +43,22 @@ struct Link {
     last_loss: Option<Instant>,
 }
 
+/// A vehicle's autopilot, from its heartbeats.
+#[derive(Clone, Copy)]
+struct Heard {
+    compid: u8,
+    mav_type: u8,
+    last: Instant,
+}
+
 #[derive(Default)]
 pub struct Stats {
     links: HashMap<(u8, u8), Link>,
-    /// (sysid, compid, mav_type, last heartbeat) of the latest vehicle heartbeat.
-    vehicle: Option<(u8, u8, u8, Instant)>,
+    vehicles: HashMap<u8, Heard>,
+    /// The sysid of the latest vehicle heartbeat.
+    latest: Option<u8>,
+    /// Set by the app; None follows `latest`.
+    follow: Option<u8>,
     pub crc_errors: u64,
 }
 
@@ -72,32 +86,75 @@ impl Stats {
                 let at = |i: usize| f.payload.get(i).copied().unwrap_or(0); // v2 trims trailing zeros
                 let (mav_type, autopilot) = (at(4), at(5));
                 if mav_type != MAV_TYPE_GCS && autopilot != MAV_AUTOPILOT_INVALID {
-                    if self.vehicle.map(|(sysid, ..)| sysid) != Some(h.sysid) {
+                    if !self.vehicles.contains_key(&h.sysid) {
                         tracing::info!(sysid = h.sysid, mav_type, "vehicle seen");
                     }
-                    self.vehicle = Some((h.sysid, h.compid, mav_type, now));
+                    let heard = Heard {
+                        compid: h.compid,
+                        mav_type,
+                        last: now,
+                    };
+                    self.vehicles.insert(h.sysid, heard);
+                    self.latest = Some(h.sysid);
                 }
             }
         }
     }
 
-    pub fn vehicle(&self, now: Instant) -> Option<VehicleStatus> {
-        let (sysid, compid, mav_type, last) = self.vehicle?;
+    /// Whose health counts: `Some(sysid)` once it is heard, None for whichever vehicle was heard last.
+    pub fn set_follow(&mut self, sysid: Option<u8>) {
+        self.follow = sysid;
+    }
+
+    /// The followed vehicle, or the latest heard while the followed one hasn't been.
+    fn followed(&self) -> Option<(u8, Heard)> {
+        let sysid = self
+            .follow
+            .filter(|s| self.vehicles.contains_key(s))
+            .or(self.latest)?;
+        Some((sysid, self.vehicles[&sysid]))
+    }
+
+    fn status(&self, sysid: u8, heard: Heard, now: Instant) -> VehicleStatus {
         let (received, lost) = self
             .links
-            .get(&(sysid, compid))
+            .get(&(sysid, heard.compid))
             .map_or((0, 0), |k| (k.received, k.lost));
-        Some(VehicleStatus {
+        let mut components: Vec<u8> = self
+            .links
+            .keys()
+            .filter(|(s, _)| *s == sysid)
+            .map(|(_, c)| *c)
+            .collect();
+        components.sort_unstable();
+        VehicleStatus {
             sysid,
-            mav_type,
-            heartbeat_age: now.saturating_duration_since(last),
+            mav_type: heard.mav_type,
+            heartbeat_age: now.saturating_duration_since(heard.last),
             received,
             lost,
-        })
+            components,
+        }
+    }
+
+    pub fn vehicle(&self, now: Instant) -> Option<VehicleStatus> {
+        let (sysid, heard) = self.followed()?;
+        Some(self.status(sysid, heard, now))
+    }
+
+    /// Every vehicle heard, by sysid.
+    pub fn vehicles(&self, now: Instant) -> Vec<VehicleStatus> {
+        let mut all: Vec<_> = self
+            .vehicles
+            .iter()
+            .map(|(&sysid, &heard)| self.status(sysid, heard, now))
+            .collect();
+        all.sort_by_key(|v| v.sysid);
+        all
     }
 
     pub fn health(&self, now: Instant) -> Health {
-        let Some((sysid, compid, _, last)) = self.vehicle else {
+        let Some((sysid, Heard { compid, last, .. })) = self.followed() else {
             return Health::NoSource;
         };
         let age = now.saturating_duration_since(last);
@@ -211,6 +268,33 @@ mod tests {
         }
         assert_eq!(s.vehicle(now).unwrap().lost, 0);
         assert_eq!(s.health(now), Health::Ok);
+    }
+
+    #[test]
+    fn tracks_every_vehicle_and_follows_the_latest() {
+        let (mut s, now) = (Stats::default(), Instant::now());
+        s.ingest(&heartbeat(0, 2, 1, 13, 3), now);
+        s.ingest(&heartbeat(0, 1, 1, 2, 3), now);
+        s.ingest(&heartbeat(0, 1, 100, 30, 8), now); // its camera
+        let all = s.vehicles(now);
+        assert_eq!(all.iter().map(|v| v.sysid).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(all[0].components, [1, 100]);
+        assert_eq!(s.vehicle(now).unwrap().sysid, 1, "heard last");
+    }
+
+    #[test]
+    fn health_is_the_followed_vehicles() {
+        let (mut s, t0) = (Stats::default(), Instant::now());
+        s.set_follow(Some(2));
+        s.ingest(&heartbeat(0, 1, 1, 2, 3), t0);
+        assert_eq!(s.vehicle(t0).unwrap().sysid, 1, "2 not heard yet");
+        s.ingest(&heartbeat(0, 2, 1, 2, 3), t0);
+        let later = t0 + Duration::from_secs(4);
+        s.ingest(&heartbeat(1, 1, 1, 2, 3), later);
+        assert_eq!(s.vehicle(later).unwrap().sysid, 2);
+        assert_eq!(s.health(later), Health::Lost, "1 is fine, 2 went quiet");
+        s.set_follow(None);
+        assert_eq!(s.health(later), Health::Ok);
     }
 
     #[test]
