@@ -1,7 +1,11 @@
 use std::{net::SocketAddr, time::Duration};
 
 use charon::{
-    config::Config, frame::testutil::heartbeat, router::port_taken, supervisor::Supervisor,
+    config::{Config, Output},
+    endpoint::Endpoint,
+    frame::testutil::heartbeat,
+    router::port_taken,
+    supervisor::Supervisor,
 };
 use tokio::net::UdpSocket;
 
@@ -17,21 +21,30 @@ async fn wait_for(mut cond: impl FnMut() -> bool) {
 
 fn cfg(outputs: Vec<SocketAddr>) -> Config {
     Config {
-        listen: any_port(),
-        outputs,
+        source: Endpoint::UdpIn(any_port()),
+        outputs: outputs.into_iter().map(out).collect(),
         ..Config::default()
     }
+}
+
+fn out(addr: SocketAddr) -> Output {
+    Output::new(addr.to_string(), Endpoint::UdpOut(addr))
 }
 
 fn any_port() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+/// Where the source listens.
+fn listen(sup: &Supervisor) -> SocketAddr {
+    sup.snapshot().source.unwrap().local_addr.unwrap()
+}
+
 #[tokio::test]
 async fn start_fails_when_port_taken() {
     let gcs = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let err = Supervisor::start(Config {
-        listen: gcs.local_addr().unwrap(),
+        source: Endpoint::UdpIn(gcs.local_addr().unwrap()),
         ..cfg(vec![])
     })
     .await
@@ -43,14 +56,14 @@ async fn start_fails_when_port_taken() {
 #[tokio::test]
 async fn looping_output_is_skipped_with_warning() {
     let sup = Supervisor::start(cfg(vec![])).await.unwrap();
-    let listen = sup.snapshot().listen;
+    let listen = listen(&sup);
     sup.apply(cfg(vec![listen]));
     wait_for(|| !sup.warnings().is_empty()).await;
     assert!(sup.snapshot().outputs.is_empty());
     assert_eq!(
         sup.warnings(),
         vec![format!(
-            "{listen} can't be an output: it targets the listen port and would loop"
+            "{listen} (udpout:{listen}) can't be an output: it sends to the source and would loop"
         )]
     );
 }
@@ -62,7 +75,7 @@ async fn apply_adds_output_without_blip() {
     let mut c = cfg(vec![gcs.local_addr().unwrap()]);
     let sup = Supervisor::start(c.clone()).await.unwrap();
     wait_for(|| sup.snapshot().outputs.len() == 1).await;
-    let listen = sup.snapshot().listen;
+    let listen = listen(&sup);
 
     let vehicle = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut buf = [0u8; 512];
@@ -72,7 +85,7 @@ async fn apply_adds_output_without_blip() {
         .unwrap();
     let (_, before) = gcs.recv_from(&mut buf).await.unwrap();
 
-    c.outputs.push(extra.local_addr().unwrap());
+    c.outputs.push(out(extra.local_addr().unwrap()));
     sup.apply(c);
     wait_for(|| sup.snapshot().outputs.len() == 2).await;
     vehicle
@@ -93,9 +106,9 @@ async fn listen_moves_and_outputs_carry_on() {
         .unwrap()
         .local_addr()
         .unwrap(); // socket dropped: port free
-    c.listen = free;
+    c.source = Endpoint::UdpIn(free);
     sup.apply(c);
-    wait_for(|| sup.snapshot().listen == free).await;
+    wait_for(|| listen(&sup) == free).await;
 
     let vehicle = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     vehicle
@@ -114,18 +127,15 @@ async fn listen_moves_and_outputs_carry_on() {
 async fn taken_listen_port_keeps_the_old_one_with_warning() {
     let mut c = cfg(vec![]);
     let sup = Supervisor::start(c.clone()).await.unwrap();
-    let old = sup.snapshot().listen;
+    let old = listen(&sup);
     let gcs = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    c.listen = gcs.local_addr().unwrap();
+    c.source = Endpoint::UdpIn(gcs.local_addr().unwrap());
     sup.apply(c.clone());
     wait_for(|| !sup.warnings().is_empty()).await;
     let w = &sup.warnings()[0];
-    assert!(
-        w.starts_with(&format!("Can't listen on {}: ", c.listen)),
-        "{w}"
-    );
-    assert!(w.ends_with(&format!("Still on {old}")), "{w}");
-    assert_eq!(sup.snapshot().listen, old);
+    assert!(w.starts_with(&format!("Can't open {}: ", c.source)), "{w}");
+    assert!(w.ends_with(&format!("Still on udpin:{old}")), "{w}");
+    assert_eq!(listen(&sup), old);
 
     let vehicle = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     vehicle

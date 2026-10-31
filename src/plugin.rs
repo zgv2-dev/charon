@@ -1,14 +1,16 @@
 //! Plugins see every datagram the router passes, in both directions. Add them with `Supervisor::add_plugin`.
 
-use std::net::SocketAddr;
+/// An output, for as long as it stays open; `RouterSnapshot::outputs` says which one it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutputId(pub u64);
 
 /// Where a datagram came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
-    /// Received on the listen port.
+    /// From the source: the vehicle.
     Vehicle,
-    /// A reply on this output's socket, normally from a GCS.
-    Output(SocketAddr),
+    /// From an output, normally a GCS.
+    Output(OutputId),
 }
 
 pub trait Plugin: Send + Sync {

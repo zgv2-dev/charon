@@ -1,31 +1,30 @@
-//! UDP fan-out. Datagrams are forwarded byte-for-byte; the router never originates or edits a packet.
+//! The fan-out. Whatever the source sends goes to every output; whatever an output sends goes to the source and the
+//! other outputs. Bytes are forwarded as they arrive (a stream's as whole frames); the router never originates or
+//! edits a packet.
 
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-
-use tokio::{net::UdpSocket, task::JoinHandle};
-
-use std::{
     path::{Path, PathBuf},
-    time::SystemTime,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime},
 };
 
 use crate::{
-    platform,
-    plugin::{Plugin, Side},
+    config::Output,
+    endpoint::Endpoint,
+    frame::frames,
+    link::{Counters, Link, OnReceive, PEER_TTL, State},
+    plugin::{OutputId, Plugin, Side},
     stats::{Health, Stats, VehicleStatus},
     tlog::Tlog,
 };
 
-/// Vehicles always send here.
+/// Where vehicles send by default.
 pub const LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14551);
-
-/// The vehicle address is forgotten after this much silence.
-pub const SOURCE_TTL: Duration = Duration::from_secs(5);
 
 /// The bind failed because another process (normally the GCS) holds the port.
 /// Windows reports an exclusive-bind conflict as WSAEACCES, hence PermissionDenied.
@@ -36,43 +35,24 @@ pub fn port_taken(e: &io::Error) -> bool {
     )
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct OutputCounters {
-    pub packets_out: u64,
-    pub bytes_out: u64,
-    pub packets_in: u64,
-    pub bytes_in: u64,
-    pub last_tx: Option<Instant>,
-    pub last_rx: Option<Instant>,
+/// An output's settings that change without reopening it.
+#[derive(Clone)]
+struct Settings {
+    name: String,
+    read_only: bool,
+    sysids: Vec<u8>,
 }
 
-struct Output {
-    target: SocketAddr,
-    /// Bound to an ephemeral port; the GCS replies here.
-    sock: UdpSocket,
-    counters: Mutex<OutputCounters>,
-    task: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Output {
-    async fn stop(&self) {
-        let task = self.task.lock().unwrap().take();
-        if let Some(t) = task {
-            t.abort();
-            let _ = t.await;
-        }
-    }
+struct OutputLink {
+    id: OutputId,
+    link: Arc<Link>,
+    settings: Mutex<Settings>,
 }
 
 struct Shared {
-    /// The vehicle side. None only while `set_listen` swaps it, or after a swap that couldn't bind anything.
-    inbound: Mutex<Option<Arc<UdpSocket>>>,
-    listen: Mutex<SocketAddr>,
-    outputs: Mutex<Vec<Arc<Output>>>,
-    /// Targets whose datagrams are dropped.
-    read_only: Mutex<Vec<SocketAddr>>,
-    /// One vehicle at a time: the latest source seen on the listen port.
-    vehicle: Mutex<Option<(SocketAddr, Instant)>>,
+    /// None only while `set_source` swaps it, or after a swap that couldn't open anything.
+    source: Mutex<Option<Arc<Link>>>,
+    outputs: Mutex<Vec<Arc<OutputLink>>>,
     stats: Mutex<Stats>,
     tlog: Mutex<Option<Tlog>>,
     plugins: Mutex<Vec<Arc<dyn Plugin>>>,
@@ -80,34 +60,44 @@ struct Shared {
 
 pub struct Router {
     shared: Arc<Shared>,
-    inbound_task: Mutex<Option<JoinHandle<()>>>,
+    next_id: AtomicU64,
 }
 
 impl Router {
-    pub async fn start(listen: SocketAddr, outputs: &[SocketAddr]) -> io::Result<Router> {
-        let inbound = bind(listen)?;
+    /// Fails when the source can't be opened, normally because its port is taken (see `port_taken`). An output that
+    /// can't be opened is left out, with its error in the result.
+    pub async fn start(
+        source: Endpoint,
+        outputs: &[Output],
+    ) -> io::Result<(Router, Vec<(String, io::Error)>)> {
         let shared = Arc::new(Shared {
-            inbound: Mutex::default(),
-            listen: Mutex::new(listen),
+            source: Mutex::default(),
             outputs: Mutex::default(),
-            read_only: Mutex::default(),
-            vehicle: Mutex::default(),
             stats: Mutex::default(),
             tlog: Mutex::default(),
             plugins: Mutex::default(),
         });
         let router = Router {
             shared,
-            inbound_task: Mutex::default(),
+            next_id: AtomicU64::new(1),
         };
-        router.run_inbound(inbound);
-        router.set_outputs(outputs).await?;
-        tracing::info!("router listening on {}", router.local_addr());
-        Ok(router)
+        router.open_source(source.clone()).await?;
+        let failed = router.set_outputs(outputs).await;
+        tracing::info!("router reading {source}");
+        Ok((router, failed))
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        *self.shared.listen.lock().unwrap()
+    pub fn source(&self) -> Option<Endpoint> {
+        self.source_link().map(|l| l.endpoint.clone())
+    }
+
+    /// Where a `udpin:` or `tcpin:` source listens: the port it got, for a port 0 bind.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.source_link()?.local_addr()
+    }
+
+    fn source_link(&self) -> Option<Arc<Link>> {
+        self.shared.source.lock().unwrap().clone()
     }
 
     /// From now on `plugin` sees every datagram.
@@ -115,68 +105,104 @@ impl Router {
         self.shared.plugins.lock().unwrap().push(plugin);
     }
 
-    /// Moves the vehicle side to `listen`; outputs, stats and the tlog carry on. On failure it stays where it was.
-    pub async fn set_listen(&self, listen: SocketAddr) -> io::Result<()> {
-        let old = self.local_addr();
-        // The old socket closes first: an exclusive bind to the same port fails while it is open.
-        self.stop_inbound().await;
-        match bind(listen) {
-            Ok(sock) => {
-                self.run_inbound(sock);
-                tracing::info!("router listening on {}", self.local_addr());
+    /// Whose health the snapshot reports: a sysid, or None for whichever vehicle was heard last.
+    pub fn set_follow(&self, sysid: Option<u8>) {
+        self.shared.stats.lock().unwrap().set_follow(sysid);
+    }
+
+    /// Reads from `source` instead; outputs, stats and the tlog carry on. On failure it stays on the old one.
+    pub async fn set_source(&self, source: Endpoint) -> io::Result<()> {
+        let old = self.shared.source.lock().unwrap().take();
+        // The old one closes first: an exclusive bind to the same port fails while it is open.
+        if let Some(old) = &old {
+            old.close().await;
+        }
+        match self.open_source(source.clone()).await {
+            Ok(()) => {
+                tracing::info!("router reading {source}");
                 Ok(())
             }
             Err(e) => {
                 // shortcut: if another app takes the old port in this gap, nothing is received until the next change
-                match bind(old) {
-                    Ok(sock) => self.run_inbound(sock),
-                    Err(e2) => tracing::error!("can't listen on {old} again: {e2}"),
+                if let Some(old) = old {
+                    // the port it had, not port 0 again
+                    let again = match (&old.endpoint, old.local_addr()) {
+                        (Endpoint::UdpIn(_), Some(a)) => Endpoint::UdpIn(a),
+                        (Endpoint::TcpServer(_), Some(a)) => Endpoint::TcpServer(a),
+                        (e, _) => e.clone(),
+                    };
+                    if let Err(e2) = self.open_source(again.clone()).await {
+                        tracing::error!("can't open {again} again: {e2}");
+                    }
                 }
                 Err(e)
             }
         }
     }
 
-    fn run_inbound(&self, sock: Arc<UdpSocket>) {
-        *self.shared.listen.lock().unwrap() = sock.local_addr().expect("bound socket");
-        *self.shared.inbound.lock().unwrap() = Some(sock.clone());
-        let task = tokio::spawn(inbound_loop(self.shared.clone(), sock));
-        *self.inbound_task.lock().unwrap() = Some(task);
-    }
-
-    async fn stop_inbound(&self) {
-        let task = self.inbound_task.lock().unwrap().take();
-        if let Some(t) = task {
-            t.abort();
-            let _ = t.await;
-        }
-        self.shared.inbound.lock().unwrap().take();
-    }
-
-    /// Outputs whose target is unchanged keep their socket, so the GCS link doesn't blip.
-    pub async fn set_outputs(&self, targets: &[SocketAddr]) -> io::Result<()> {
-        let old = self.shared.outputs.lock().unwrap().clone();
-        let mut next = Vec::with_capacity(targets.len());
-        for &target in targets {
-            match old.iter().find(|o| o.target == target) {
-                Some(o) => next.push(o.clone()),
-                None => {
-                    next.push(self.spawn_output(target).await?);
-                    tracing::info!("output added: {target}");
-                }
+    async fn open_source(&self, source: Endpoint) -> io::Result<()> {
+        let shared = Arc::downgrade(&self.shared);
+        let on_rx: OnReceive = Arc::new(move |data| {
+            if let Some(s) = shared.upgrade() {
+                s.on_source(data);
             }
-        }
-        *self.shared.outputs.lock().unwrap() = next;
-        for o in old.iter().filter(|o| !targets.contains(&o.target)) {
-            o.stop().await;
-            tracing::info!("output removed: {}", o.target);
-        }
+        });
+        let link = Link::open(source, on_rx).await?;
+        *self.shared.source.lock().unwrap() = Some(link);
         Ok(())
     }
 
-    /// Whatever these outputs send from now on is counted and dropped: not routed, recorded or shown to plugins.
-    pub fn set_read_only(&self, targets: &[SocketAddr]) {
-        *self.shared.read_only.lock().unwrap() = targets.to_vec();
+    /// Applies the enabled outputs. One whose endpoint is unchanged keeps its link, so the GCS doesn't blip; its
+    /// name, read-only flag and sysids change in place. Returns the ones that couldn't be opened.
+    pub async fn set_outputs(&self, outputs: &[Output]) -> Vec<(String, io::Error)> {
+        let old = self.shared.outputs.lock().unwrap().clone();
+        let mut next = Vec::with_capacity(outputs.len());
+        let mut failed = Vec::new();
+        for o in outputs.iter().filter(|o| o.enabled) {
+            if next
+                .iter()
+                .any(|n: &Arc<OutputLink>| n.link.endpoint == o.endpoint)
+            {
+                continue; // listed twice: the first one wins
+            }
+            let settings = Settings {
+                name: o.name.clone(),
+                read_only: o.read_only,
+                sysids: o.sysids.clone(),
+            };
+            if let Some(kept) = old.iter().find(|k| k.link.endpoint == o.endpoint) {
+                *kept.settings.lock().unwrap() = settings;
+                next.push(kept.clone());
+                continue;
+            }
+            let id = OutputId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let shared = Arc::downgrade(&self.shared);
+            let on_rx: OnReceive = Arc::new(move |data| {
+                if let Some(s) = shared.upgrade() {
+                    s.on_output(id, data);
+                }
+            });
+            match Link::open(o.endpoint.clone(), on_rx).await {
+                Ok(link) => {
+                    tracing::info!("output added: {} ({})", o.name, o.endpoint);
+                    next.push(Arc::new(OutputLink {
+                        id,
+                        link,
+                        settings: Mutex::new(settings),
+                    }));
+                }
+                Err(e) => failed.push((o.name.clone(), e)),
+            }
+        }
+        *self.shared.outputs.lock().unwrap() = next.clone();
+        for o in old
+            .iter()
+            .filter(|o| !next.iter().any(|n| Arc::ptr_eq(n, o)))
+        {
+            o.link.close().await;
+            tracing::info!("output removed: {}", o.link.endpoint);
+        }
+        failed
     }
 
     /// `Some(dir)` starts a new log file there; `None` stops recording.
@@ -206,29 +232,13 @@ impl Router {
     pub async fn stop(&self) {
         let outputs = std::mem::take(&mut *self.shared.outputs.lock().unwrap());
         for o in &outputs {
-            o.stop().await;
+            o.link.close().await;
         }
-        self.stop_inbound().await;
+        let source = self.shared.source.lock().unwrap().take();
+        if let Some(s) = source {
+            s.close().await;
+        }
         tracing::info!("router stopped");
-    }
-
-    async fn spawn_output(&self, target: SocketAddr) -> io::Result<Arc<Output>> {
-        // shortcut: non-loopback IPv6 targets unsupported, add when someone needs one
-        let ip = if target.ip().is_loopback() {
-            target.ip()
-        } else {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        };
-        let sock = UdpSocket::bind(SocketAddr::new(ip, 0)).await?;
-        let out = Arc::new(Output {
-            target,
-            sock,
-            counters: Mutex::default(),
-            task: Mutex::default(),
-        });
-        let task = tokio::spawn(output_loop(self.shared.clone(), out.clone()));
-        *out.task.lock().unwrap() = Some(task);
-        Ok(out)
     }
 }
 
@@ -240,111 +250,103 @@ impl Shared {
         }
     }
 
-    // shortcut: blocking file write on the async path; fine at telemetry rates, move to a writer task if it shows up in latency
+    // shortcut: blocking file write on the routing path; fine at telemetry rates, move to a writer task if it shows up in latency
     fn record(&self, data: &[u8]) {
         let mut tlog = self.tlog.lock().unwrap();
-        if let Some(log) = tlog.as_mut() {
-            if let Err(e) = log.write(data, SystemTime::now()) {
-                tracing::warn!("tlog write failed, recording stopped: {e}");
-                *tlog = None; // routing must not stop because the disk is full
-            }
+        if let Some(log) = tlog.as_mut()
+            && let Err(e) = log.write(data, SystemTime::now())
+        {
+            tracing::warn!("tlog write failed, recording stopped: {e}");
+            *tlog = None; // routing must not stop because the disk is full
         }
     }
 
-    async fn to_outputs(&self, data: &[u8], except: Option<SocketAddr>) {
+    fn to_outputs(&self, data: &[u8], except: Option<OutputId>) {
         let outputs = self.outputs.lock().unwrap().clone();
-        for o in outputs.iter().filter(|o| Some(o.target) != except) {
-            if o.sock.send_to(data, o.target).await.is_ok() {
-                let mut c = o.counters.lock().unwrap();
-                c.packets_out += 1;
-                c.bytes_out += data.len() as u64;
-                c.last_tx = Some(Instant::now());
+        for o in outputs.iter().filter(|o| Some(o.id) != except) {
+            let sysids = o.settings.lock().unwrap().sysids.clone();
+            if sysids.is_empty() {
+                o.link.send(data);
+                continue;
+            }
+            // only the frames of those systems; anything not a frame can't be told apart, so it stays out too
+            let picked: Vec<u8> = frames(data)
+                .iter()
+                .filter(|f| sysids.contains(&f.header.sysid))
+                .flat_map(|f| f.bytes.iter().copied())
+                .collect();
+            if !picked.is_empty() {
+                o.link.send(&picked);
             }
         }
     }
 
-    async fn to_vehicle(&self, data: &[u8]) {
-        let vehicle = self
-            .vehicle
+    fn on_source(&self, data: &[u8]) {
+        self.stats.lock().unwrap().ingest(data, Instant::now());
+        self.record(data);
+        self.to_plugins(data, Side::Vehicle);
+        self.to_outputs(data, None);
+    }
+
+    fn on_output(&self, id: OutputId, data: &[u8]) {
+        let read_only = self
+            .outputs
             .lock()
             .unwrap()
-            .filter(|(_, seen)| seen.elapsed() < SOURCE_TTL);
-        let inbound = self.inbound.lock().unwrap().clone();
-        if let (Some((addr, _)), Some(sock)) = (vehicle, inbound) {
-            let _ = sock.send_to(data, addr).await;
+            .iter()
+            .find(|o| o.id == id)
+            .is_none_or(|o| o.settings.lock().unwrap().read_only);
+        if read_only {
+            return; // counted by its link, and dropped
         }
+        self.stats.lock().unwrap().ingest(data, Instant::now());
+        self.record(data);
+        self.to_plugins(data, Side::Output(id));
+        if let Some(source) = self.source.lock().unwrap().clone() {
+            source.send(data);
+        }
+        self.to_outputs(data, Some(id));
     }
 }
 
-/// recv_from that never gives up: Windows reports an ICMP "port unreachable" from an earlier send
-/// as WSAECONNRESET on the next receive.
-async fn recv(sock: &UdpSocket, buf: &mut [u8]) -> (usize, SocketAddr) {
-    loop {
-        match sock.recv_from(buf).await {
-            Ok(r) => return r,
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-            Err(e) => {
-                tracing::warn!("udp recv: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct LinkStatus {
+    pub endpoint: Endpoint,
+    /// Where a UDP or `tcpin:` link is bound: the real port when the endpoint asked for port 0.
+    pub local_addr: Option<SocketAddr>,
+    pub state: State,
+    pub counters: Counters,
 }
 
-fn bind(addr: SocketAddr) -> io::Result<Arc<UdpSocket>> {
-    Ok(Arc::new(UdpSocket::from_std(
-        platform::bind_udp_exclusive(addr)?,
-    )?))
-}
-
-async fn inbound_loop(shared: Arc<Shared>, sock: Arc<UdpSocket>) {
-    let mut buf = vec![0u8; 65_536];
-    loop {
-        let (n, from) = recv(&sock, &mut buf).await;
-        let data = &buf[..n];
-        *shared.vehicle.lock().unwrap() = Some((from, Instant::now()));
-        shared.stats.lock().unwrap().ingest(data, Instant::now());
-        shared.record(data);
-        shared.to_plugins(data, Side::Vehicle);
-        shared.to_outputs(data, None).await;
-    }
-}
-
-async fn output_loop(shared: Arc<Shared>, out: Arc<Output>) {
-    let mut buf = vec![0u8; 65_536];
-    loop {
-        let (n, _) = recv(&out.sock, &mut buf).await;
-        let data = &buf[..n];
-        {
-            let mut c = out.counters.lock().unwrap();
-            c.packets_in += 1;
-            c.bytes_in += n as u64;
-            c.last_rx = Some(Instant::now());
+impl LinkStatus {
+    fn of(link: &Link) -> LinkStatus {
+        LinkStatus {
+            endpoint: link.endpoint.clone(),
+            local_addr: link.local_addr(),
+            state: link.state(),
+            counters: link.counters(),
         }
-        if shared.read_only.lock().unwrap().contains(&out.target) {
-            continue;
-        }
-        shared.stats.lock().unwrap().ingest(data, Instant::now());
-        shared.record(data);
-        shared.to_plugins(data, Side::Output(out.target));
-        shared.to_vehicle(data).await;
-        shared.to_outputs(data, Some(out.target)).await;
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputStatus {
-    pub target: SocketAddr,
-    pub counters: OutputCounters,
-    /// Something replied on this output's socket within SOURCE_TTL.
+    pub id: OutputId,
+    pub name: String,
+    pub read_only: bool,
+    pub link: LinkStatus,
+    /// Something replied on this output within PEER_TTL.
     pub gcs_connected: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RouterSnapshot {
-    pub listen: SocketAddr,
+    /// None only between a failed source change and the next one.
+    pub source: Option<LinkStatus>,
     pub health: Health,
+    /// The followed vehicle.
     pub vehicle: Option<VehicleStatus>,
+    pub vehicles: Vec<VehicleStatus>,
     pub outputs: Vec<OutputStatus>,
     pub crc_errors: u64,
 }
@@ -359,22 +361,27 @@ impl Router {
             .unwrap()
             .iter()
             .map(|o| {
-                let counters = o.counters.lock().unwrap().clone();
-                let gcs_connected = counters
+                let link = LinkStatus::of(&o.link);
+                let settings = o.settings.lock().unwrap().clone();
+                let gcs_connected = link
+                    .counters
                     .last_rx
-                    .is_some_and(|t| now.saturating_duration_since(t) < SOURCE_TTL);
+                    .is_some_and(|t| now.saturating_duration_since(t) < PEER_TTL);
                 OutputStatus {
-                    target: o.target,
-                    counters,
+                    id: o.id,
+                    name: settings.name,
+                    read_only: settings.read_only,
+                    link,
                     gcs_connected,
                 }
             })
             .collect();
         let stats = self.shared.stats.lock().unwrap();
         RouterSnapshot {
-            listen: self.local_addr(),
+            source: self.source_link().map(|l| LinkStatus::of(&l)),
             health: stats.health(now),
             vehicle: stats.vehicle(now),
+            vehicles: stats.vehicles(now),
             outputs,
             crc_errors: stats.crc_errors,
         }
